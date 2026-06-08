@@ -62,10 +62,13 @@ def get_wifi_info():
     return ssid, password
 
 def image_to_jpeg(path: str) -> bytes:
-    """resize به 240×280 + 180° rotate + swap R↔B قبل از ارسال به ESP"""
+    """resize به 240×280 + قرینه‌سازی عمودی (رفع مشکل برعکس بودن محور Y) + swap R↔B قبل از ارسال به ESP"""
     img = Image.open(path).convert("RGB")
     img = img.resize((IMG_W, IMG_H), Image.LANCZOS)
-    img = img.rotate(180)                         # برعکس کردن (180°)
+    
+    # اصلاح اصلی: به جای چرخش 180 درجه، تصویر را در محور عمودی آینه (Flip) می‌کنیم
+    img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    
     r, g, b = img.split()
     img = Image.merge("RGB", (b, g, r))           # swap R↔B
     buf = io.BytesIO()
