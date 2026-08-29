@@ -12,3 +12,7 @@
 
 #define TIME_API_BASE       "https://timeapi.io/api/Time/current/zone?timeZone="
 #define TIME_API_DEFAULT_TZ "Asia/Tehran"
+#define WEB_AP_SSID "SmartClock-Setup"
+#define WEB_AP_PASS "clocksetup"
+#define WEB_PORT 80
+#define WEB_MAX_IMAGE_BYTES 262144UL

@@ -235,3 +235,29 @@ python main.py
 - ESP تصاویر را با نام‌های `/img1.jpg` و `/img2.jpg` در SPIFFS ذخیره می‌کند.
 - فریمور از آدرس پایه `https://timeapi.io/api/Time/current/zone?timeZone=` برای دریافت ساعت آنلاین استفاده می‌کند.
 - نام فایل وابستگی‌ها در این مخزن `requirments.txt` است.
+
+## ESP Web Control Panel / پنل وب ESP
+
+The firmware now includes a built-in web controller, so the clock can be configured without the Windows/Python serial application.
+
+After boot, the ESP32 creates a setup access point while also trying to connect to the saved Wi-Fi network:
+
+- Setup Wi-Fi name: `SmartClock-Setup`
+- Setup Wi-Fi password: `clocksetup`
+- Setup page: `http://192.168.4.1/`
+- When the ESP joins your router, the same panel is also available at the ESP's local STA IP shown in Serial Monitor and on the web status card.
+
+The web panel supports:
+
+- viewing ESP clock/status, Wi-Fi state, STA IP, setup AP IP, and timezone;
+- setting Wi-Fi SSID/password;
+- choosing the same regions/timezones as the Python controller and synchronizing time;
+- uploading Image 1 and Image 2 directly from a browser;
+- browser-side conversion to the same `240×280` JPEG format used by the Python app, including the existing orientation/channel transformation expected by this firmware;
+- previewing and deleting stored images;
+- restarting the ESP;
+- erasing saved flash storage.
+
+**Erase Flash Storage** clears the `espctl` Preferences namespace and formats SPIFFS, which deletes saved Wi-Fi/timezone settings and both images. The firmware itself is not erased. The ESP restarts afterward and the setup access point becomes available again.
+
+> The desktop controller is still supported. Its region action now also sends `SETTZ:<timezone>` before `TIME:...`, so the selected timezone is persisted correctly.

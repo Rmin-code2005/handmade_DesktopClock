@@ -6,10 +6,18 @@
 #include <Preferences.h>
 #include <SPIFFS.h>
 #include <TJpg_Decoder.h>
+#include <WebServer.h>
 #include "config.h"
+#include "web_ui.h"
 
 Preferences prefs;
 TFT_eSPI    tft;
+WebServer   webServer(WEB_PORT);
+
+File     webUploadFile;
+int      webUploadSlot = 0;
+size_t   webUploadBytes = 0;
+bool     webUploadFailed = false;
 
 uint16_t C_BG, C_ACCENT, C_WHITE, C_GRAY, C_DARK, C_GREEN, C_LINE, C_AMBIENT;
 
@@ -32,6 +40,7 @@ String rPASS = WIFI_PASS;
 uint32_t lastSecondTick  = 0;
 uint32_t lastApiSync     = 0;
 uint32_t lastSlideSwitch = 0;
+uint32_t lastWiFiRetry   = 0;
 
 // ── slideshow ──
 bool     imgAvailable[2]  = {false, false};
@@ -108,7 +117,7 @@ void connectWiFi()
     if (rSSID.length() == 0) return;
 
     Serial.printf("Connecting to %s\n", rSSID.c_str());
-    WiFi.mode(WIFI_STA);
+    WiFi.mode(WIFI_AP_STA);
     WiFi.begin(rSSID.c_str(), rPASS.c_str());
 
     uint32_t start = millis();
@@ -204,10 +213,17 @@ void drawUI()
     int fill = map(gSecond, 0, 59, 0, barW);
     if (fill > 0) tft.fillRoundRect(barX, barY, fill, barH, 1, C_ACCENT);
 
+    // Network info: show the hotspot/router-assigned STA IP just above the UTC label.
+    // Keep it deliberately small and subtle so it does not compete with the clock.
+    tft.setTextSize(1);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_GRAY, C_BG);
+
+    String ipLabel = wifiConnected ? WiFi.localIP().toString() : String("--");
+    tft.drawString(ipLabel.c_str(), SCREEN_WIDTH / 2, 237);
+
     uint16_t dotColor = wifiConnected ? C_GREEN : C_GRAY;
     tft.fillCircle(SCREEN_WIDTH / 2 - 45, 256, 4, dotColor);
-    tft.setTextSize(1);
-    tft.setTextColor(C_GRAY, C_BG);
     tft.setTextDatum(ML_DATUM);
     tft.drawString(gCityLabel.c_str(), SCREEN_WIDTH / 2 - 37, 256);
 }
@@ -347,6 +363,270 @@ void receiveImage(int idx, uint32_t size)
     }
 }
 
+
+// ════════════════════════════════════════════
+//  Embedded Web control panel
+// ════════════════════════════════════════════
+String jsonEscape(const String& value)
+{
+    String out;
+    out.reserve(value.length() + 8);
+    for (size_t i = 0; i < value.length(); i++)
+    {
+        char c = value[i];
+        if (c == '\\' || c == '"') { out += '\\'; out += c; }
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else out += c;
+    }
+    return out;
+}
+
+void sendJson(int code, const String& body)
+{
+    webServer.sendHeader("Cache-Control", "no-store");
+    webServer.send(code, "application/json", body);
+}
+
+void startSetupAccessPoint()
+{
+    WiFi.mode(WIFI_AP_STA);
+    bool ok = WiFi.softAP(WEB_AP_SSID, WEB_AP_PASS);
+    if (ok)
+    {
+        Serial.printf("Web setup AP: %s  IP=%s\n", WEB_AP_SSID, WiFi.softAPIP().toString().c_str());
+    }
+    else Serial.println("ERR: failed to start setup AP");
+}
+
+void handleWebStatus()
+{
+    String body = "{";
+    body += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
+    body += ",\"ssid\":\"" + jsonEscape(rSSID) + "\"";
+    body += ",\"sta_ip\":\"" + jsonEscape(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("")) + "\"";
+    body += ",\"ap_ip\":\"" + jsonEscape(WiFi.softAPIP().toString()) + "\"";
+    body += ",\"timezone\":\"" + jsonEscape(gTimezone) + "\"";
+    body += ",\"city_label\":\"" + jsonEscape(gCityLabel) + "\"";
+    body += ",\"img1\":" + String(imgAvailable[0] ? "true" : "false");
+    body += ",\"img2\":" + String(imgAvailable[1] ? "true" : "false");
+    body += ",\"time\":\"" + String(gHour < 10 ? "0" : "") + String(gHour) + ":" + String(gMinute < 10 ? "0" : "") + String(gMinute) + ":" + String(gSecond < 10 ? "0" : "") + String(gSecond) + "\"";
+    body += "}";
+    sendJson(200, body);
+}
+
+void handleWebWifi()
+{
+    if (!webServer.hasArg("ssid")) { sendJson(400, "{\"message\":\"SSID is required\"}"); return; }
+
+    String newSsid = webServer.arg("ssid");
+    newSsid.trim();
+    if (newSsid.length() == 0 || newSsid.length() > 32)
+    {
+        sendJson(400, "{\"message\":\"Invalid SSID\"}");
+        return;
+    }
+
+    String oldSsid = rSSID;
+    String newPass = webServer.hasArg("password") ? webServer.arg("password") : String("");
+    rSSID = newSsid;
+    if (newPass.length() > 0 || oldSsid != newSsid) rPASS = newPass;
+
+    saveToFlash();
+    WiFi.disconnect(false, false);
+    delay(150);
+    connectWiFi();
+    if (wifiConnected) syncTime();
+    if (!showingSlide) drawUI();
+
+    if (wifiConnected)
+        sendJson(200, "{\"message\":\"Wi-Fi connected and settings saved\"}");
+    else
+        sendJson(200, "{\"message\":\"Settings saved, but Wi-Fi connection failed. Setup AP is still available.\"}");
+}
+
+void handleWebTimezone()
+{
+    if (!webServer.hasArg("timezone")) { sendJson(400, "{\"message\":\"timezone is required\"}"); return; }
+    String tz = webServer.arg("timezone");
+    tz.trim();
+    if (tz.length() == 0 || tz.length() > 64) { sendJson(400, "{\"message\":\"Invalid timezone\"}"); return; }
+
+    gTimezone = tz;
+    if (webServer.hasArg("label"))
+    {
+        gCityLabel = webServer.arg("label");
+        gCityLabel.trim();
+        if (gCityLabel.length() > 20) gCityLabel = gCityLabel.substring(0, 20);
+    }
+
+    // Browser-provided local time mirrors the Python controller and works even offline.
+    if (webServer.hasArg("hour") && webServer.hasArg("minute") && webServer.hasArg("second"))
+    {
+        gHour = constrain(webServer.arg("hour").toInt(), 0, 23);
+        gMinute = constrain(webServer.arg("minute").toInt(), 0, 59);
+        gSecond = constrain(webServer.arg("second").toInt(), 0, 59);
+        lastSecondTick = millis();
+    }
+
+    saveToFlash();
+    bool synced = wifiConnected && syncTime();
+    if (!showingSlide) drawUI();
+    sendJson(200, synced ? "{\"message\":\"Region saved and online time synced\"}" : "{\"message\":\"Region saved; browser local time applied\"}");
+}
+
+void handleWebSync()
+{
+    if (!wifiConnected) { sendJson(409, "{\"message\":\"Wi-Fi is not connected\"}"); return; }
+    if (!syncTime()) { sendJson(502, "{\"message\":\"Online time sync failed\"}"); return; }
+    if (!showingSlide) drawUI();
+    sendJson(200, "{\"message\":\"Time synced successfully\"}");
+}
+
+void handleWebImageUpload(int slot)
+{
+    HTTPUpload& upload = webServer.upload();
+    const char* path = IMG_PATH[slot - 1];
+
+    if (upload.status == UPLOAD_FILE_START)
+    {
+        webUploadSlot = slot;
+        webUploadBytes = 0;
+        webUploadFailed = false;
+        if (SPIFFS.exists(path)) SPIFFS.remove(path);
+        webUploadFile = SPIFFS.open(path, FILE_WRITE);
+        if (!webUploadFile) webUploadFailed = true;
+    }
+    else if (upload.status == UPLOAD_FILE_WRITE)
+    {
+        if (webUploadSlot != slot || webUploadFailed) return;
+        if (webUploadBytes + upload.currentSize > WEB_MAX_IMAGE_BYTES)
+        {
+            webUploadFailed = true;
+            if (webUploadFile) webUploadFile.close();
+            SPIFFS.remove(path);
+            return;
+        }
+        if (!webUploadFile || webUploadFile.write(upload.buf, upload.currentSize) != upload.currentSize)
+        {
+            webUploadFailed = true;
+            if (webUploadFile) webUploadFile.close();
+            SPIFFS.remove(path);
+            return;
+        }
+        webUploadBytes += upload.currentSize;
+    }
+    else if (upload.status == UPLOAD_FILE_END)
+    {
+        if (webUploadFile) webUploadFile.close();
+        if (!webUploadFailed && webUploadBytes > 2)
+        {
+            File check = SPIFFS.open(path, FILE_READ);
+            bool jpeg = false;
+            if (check)
+            {
+                int a = check.read(), b = check.read();
+                jpeg = (a == 0xFF && b == 0xD8);
+                check.close();
+            }
+            if (!jpeg) { webUploadFailed = true; SPIFFS.remove(path); }
+        }
+        else { webUploadFailed = true; SPIFFS.remove(path); }
+
+        imgAvailable[slot - 1] = !webUploadFailed;
+        if (imgAvailable[slot - 1])
+        {
+            currentSlide = slot - 1;
+            showingSlide = true;
+            slideShowTimer = millis();
+            showImage(currentSlide);
+        }
+    }
+    else if (upload.status == UPLOAD_FILE_ABORTED)
+    {
+        webUploadFailed = true;
+        if (webUploadFile) webUploadFile.close();
+        SPIFFS.remove(path);
+        imgAvailable[slot - 1] = false;
+    }
+}
+
+void finishWebImageUpload(int slot)
+{
+    if (webUploadSlot != slot || webUploadFailed || !imgAvailable[slot - 1])
+    {
+        sendJson(400, "{\"message\":\"Image upload failed or exceeded 256 KB\"}");
+        return;
+    }
+    sendJson(200, "{\"message\":\"Image saved to ESP flash\"}");
+}
+
+void handleDeleteWebImage(int slot)
+{
+    const char* path = IMG_PATH[slot - 1];
+    if (SPIFFS.exists(path)) SPIFFS.remove(path);
+    imgAvailable[slot - 1] = false;
+    if (showingSlide && currentSlide == slot - 1)
+    {
+        showingSlide = false;
+        currentSlide = -1;
+        lastSlideSwitch = millis();
+        drawUI();
+    }
+    sendJson(200, "{\"message\":\"Image deleted\"}");
+}
+
+void handleGetWebImage(int slot)
+{
+    const char* path = IMG_PATH[slot - 1];
+    if (!SPIFFS.exists(path)) { webServer.send(404, "text/plain", "Not found"); return; }
+    File f = SPIFFS.open(path, FILE_READ);
+    webServer.sendHeader("Cache-Control", "no-store");
+    webServer.streamFile(f, "image/jpeg");
+    f.close();
+}
+
+void handleWebRestart()
+{
+    sendJson(200, "{\"message\":\"ESP restarting\"}");
+    delay(250);
+    ESP.restart();
+}
+
+void handleWebEraseStorage()
+{
+    prefs.begin("espctl", false);
+    prefs.clear();
+    prefs.end();
+    SPIFFS.format();
+    imgAvailable[0] = imgAvailable[1] = false;
+    sendJson(200, "{\"message\":\"Flash storage erased; ESP restarting\"}");
+    delay(300);
+    ESP.restart();
+}
+
+void startWebServer()
+{
+    webServer.on("/", HTTP_GET, []() { webServer.send_P(200, "text/html; charset=utf-8", WEB_UI_HTML); });
+    webServer.on("/api/status", HTTP_GET, handleWebStatus);
+    webServer.on("/api/wifi", HTTP_POST, handleWebWifi);
+    webServer.on("/api/timezone", HTTP_POST, handleWebTimezone);
+    webServer.on("/api/sync", HTTP_POST, handleWebSync);
+
+    webServer.on("/api/image/1", HTTP_POST, []() { finishWebImageUpload(1); }, []() { handleWebImageUpload(1); });
+    webServer.on("/api/image/2", HTTP_POST, []() { finishWebImageUpload(2); }, []() { handleWebImageUpload(2); });
+    webServer.on("/api/image/1", HTTP_DELETE, []() { handleDeleteWebImage(1); });
+    webServer.on("/api/image/2", HTTP_DELETE, []() { handleDeleteWebImage(2); });
+    webServer.on("/image/1", HTTP_GET, []() { handleGetWebImage(1); });
+    webServer.on("/image/2", HTTP_GET, []() { handleGetWebImage(2); });
+    webServer.on("/api/restart", HTTP_POST, handleWebRestart);
+    webServer.on("/api/erase-storage", HTTP_POST, handleWebEraseStorage);
+    webServer.onNotFound([]() { webServer.send(404, "application/json", "{\"message\":\"Not found\"}"); });
+
+    webServer.begin();
+    Serial.println("Web server started on port 80");
+}
+
 // ════════════════════════════════════════════
 //  Serial parser
 // ════════════════════════════════════════════
@@ -368,7 +648,7 @@ void handleSerial()
         rPASS = data.substring(comma + 1);
 
         Serial.printf("OK:WIFI ssid=%s\n", rSSID.c_str());
-        WiFi.disconnect(true);
+        WiFi.disconnect(false, false);
         delay(300);
         wifiConnected = false;
 
@@ -468,7 +748,9 @@ void setup()
 
     loadFromFlash();
 
+    startSetupAccessPoint();
     if (rSSID.length() > 0) { connectWiFi(); syncTime(); }
+    startWebServer();
 
     drawUI();
 
@@ -484,6 +766,7 @@ void loop()
     static int lastSec = -1;
 
     handleSerial();
+    webServer.handleClient();
     tickClock();
 
     // آپدیت ثانیه (فقط وقتی slide نشون نمی‌دیم)
@@ -502,8 +785,12 @@ void loop()
         syncTime();
     }
 
-    if (!wifiConnected && rSSID.length() > 0)
+    wifiConnected = (WiFi.status() == WL_CONNECTED);
+    if (!wifiConnected && rSSID.length() > 0 && millis() - lastWiFiRetry >= WIFI_RETRY_MS)
+    {
+        lastWiFiRetry = millis();
         connectWiFi();
+    }
 
     delay(50);
 }

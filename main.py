@@ -433,6 +433,7 @@ class App(tk.Tk):
         if country not in COUNTRIES: return
         tz, utc = COUNTRIES[country]
         now = datetime.now(ZoneInfo(tz))
+        self._send(f"SETTZ:{tz}")
         self._send(f"TIME:{now.hour},{now.minute},{now.second},{utc}")
 
     # ── tick ─────────────────────────────────
