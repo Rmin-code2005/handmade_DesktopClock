@@ -8,7 +8,7 @@
 
 #define SCREEN_WIDTH  240
 #define SCREEN_HEIGHT 280
-#define ROTATION     0
+#define ROTATION     2
 
 #define TIME_API_BASE       "https://timeapi.io/api/Time/current/zone?timeZone="
 #define TIME_API_DEFAULT_TZ "Asia/Tehran"
